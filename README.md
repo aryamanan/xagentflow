@@ -1,4 +1,4 @@
-# xautoflow
+# xagentflow
 
 A powerful AI-driven financial analysis platform that enables users to research financial assets, generate and execute trading strategies, and perform backtesting.
 
@@ -18,7 +18,7 @@ A powerful AI-driven financial analysis platform that enables users to research 
 - **Workflow/Planning:** LangGraph
 - **Multi-Agent Communication:** Autogen
 - **Local RAG:** LlamaIndex with BM25
-- **Database:** PostgreSQL with SQLAlchemy
+- **Database:** SQLite with SQLAlchemy
 - **Data Handling:** Pandas, NumPy
 - **Fintech Tools:** pandas-ta, scikit-optimize, vectorbt
 
@@ -26,8 +26,8 @@ A powerful AI-driven financial analysis platform that enables users to research 
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/finsight-agent.git
-cd finsight-agent
+git clone https://github.com/yourusername/xagentflow.git
+cd xagentflow
 ```
 
 2. Create and activate a virtual environment:
@@ -48,18 +48,13 @@ cp .env.template .env
 
 5. Configure the following environment variables in `.env`:
 ```bash
-DATABASE_URL=postgresql://user:password@localhost:5432/finsight
+DATABASE_URL=sqlite+aiosqlite:///./xagentflow.db
 GEMINI_API_KEY=your_gemini_api_key
 EXTERNAL_MARKET_DATA_API_URL=your_market_data_api_url
 EXTERNAL_MARKET_DATA_API_KEY=your_market_data_api_key
-EXTERNAL_NEWS_API_URL=your_news_api_url
-EXTERNAL_NEWS_API_KEY=your_news_api_key
+# EXTERNAL_NEWS_API_URL=your_news_api_url # Removed
+# EXTERNAL_NEWS_API_KEY=your_news_api_key # Removed
 LOCAL_KB_PATH=/path/to/knowledge/base
-```
-
-6. Initialize the database:
-```bash
-alembic upgrade head
 ```
 
 ## Running the Application
@@ -76,17 +71,12 @@ http://localhost:8000/docs
 
 ## Testing
 
-1. Create a test database:
-```bash
-createdb finsight_test
-```
-
-2. Run tests:
+1. Run tests:
 ```bash
 pytest
 ```
 
-3. Run tests with coverage:
+2. Run tests with coverage:
 ```bash
 pytest --cov=app tests/
 ```
@@ -119,18 +109,6 @@ flake8 app tests
 3. Run type checking:
 ```bash
 mypy app
-```
-
-## Docker Deployment
-
-1. Build the Docker image:
-```bash
-docker build -t finsight-agent .
-```
-
-2. Run with docker-compose:
-```bash
-docker-compose up -d
 ```
 
 ## Contributing

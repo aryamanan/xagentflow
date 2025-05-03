@@ -24,6 +24,12 @@ def get_bm25_retriever() -> BM25Retriever:
     # Load documents from the configured directory
     documents = load_documents()
     
+    # If no documents are found, create a dummy document to initialize the retriever
+    if not documents:
+        logger.warning("No documents found in knowledge base. Using dummy document.")
+        from langchain_core.documents import Document
+        documents = [Document(page_content="Empty knowledge base", metadata={"source": "dummy"})]
+    
     # Split documents into chunks
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=512,

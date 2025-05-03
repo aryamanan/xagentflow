@@ -3,16 +3,14 @@ from pydantic_settings import BaseSettings
 from pydantic import PostgresDsn, DirectoryPath
 
 class Settings(BaseSettings):
-    PROJECT_NAME: str = "FinSight Agent"
+    PROJECT_NAME: str = "XAgentFlow"
     API_V1_STR: str = "/api/v1"
     API_KEY: str = "development_key"  # Default value for development
     
-    DATABASE_URL: PostgresDsn
+    DATABASE_URL: str = "sqlite+aiosqlite:///./test.db"  # Default SQLite database
     GEMINI_API_KEY: str
     EXTERNAL_MARKET_DATA_API_URL: str
     EXTERNAL_MARKET_DATA_API_KEY: Optional[str] = None
-    EXTERNAL_NEWS_API_URL: str
-    EXTERNAL_NEWS_API_KEY: Optional[str] = None
     LOCAL_KB_PATH: DirectoryPath
 
     # Yahoo Finance Endpoints

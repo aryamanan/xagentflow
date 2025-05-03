@@ -1,61 +1,27 @@
 from typing import Dict, Any
-from .base_agent import BaseAssistantAgent, get_base_llm_config
+from .base_agent import BaseAssistantAgent
 from app.tools.knowledge_tools import query_local_kb
-from app.tools.news_api_tool import get_financial_news
+import asyncio
+from app.tools.financial_tools import fetch_historical_data
 
 RESEARCH_PROMPT = """You are a financial research analyst. Execute specific research tasks using available tools:
 1. Query knowledge base for relevant information
-2. Fetch and analyze financial news
-3. Synthesize findings into clear, actionable insights
+2. Synthesize findings into clear, actionable insights
 Always provide structured, concise results."""
 
 class ResearchAgent(BaseAssistantAgent):
     def __init__(self):
         super().__init__(
             name="ResearchAgent",
-            description=RESEARCH_PROMPT,
-            llm_config={
-                **get_base_llm_config(),
-                "functions": [
-                    {
-                        "name": "query_local_kb",
-                        "description": "Query the local knowledge base",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": "The search query"
-                                }
-                            },
-                            "required": ["query"]
-                        }
-                    },
-                    {
-                        "name": "get_financial_news",
-                        "description": "Fetch financial news articles",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": "The news search query"
-                                },
-                                "max_results": {
-                                    "type": "integer",
-                                    "default": 10
-                                }
-                            },
-                            "required": ["query"]
-                        }
-                    }
-                ]
-            }
+            description=RESEARCH_PROMPT
         )
+        self.system_prompt = RESEARCH_PROMPT
     
     async def synthesize_findings(self, intermediate_results: Dict[str, Any]) -> Dict[str, Any]:
         """Synthesize research findings into a coherent summary."""
-        prompt = f"""Given the following intermediate research results:
+        prompt = f"""{self.system_prompt}
+
+Given the following intermediate research results:
 {intermediate_results}
 
 Synthesize these findings into a clear, actionable summary. Include:
@@ -66,6 +32,21 @@ Synthesize these findings into a clear, actionable summary. Include:
         
         response = await self.generate_response(prompt)
         return {"summary": response}
+
+    async def research(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a research task."""
+        prompt = f"""{self.system_prompt}
+
+Research Request: {request.get('prompt', '')}
+
+Please analyze this request and provide:
+1. Key findings
+2. Supporting data
+3. Analysis
+4. Recommendations"""
+
+        response = await self.generate_response(prompt)
+        return {"content": response}
 
 def create_research_agent() -> ResearchAgent:
     return ResearchAgent()
