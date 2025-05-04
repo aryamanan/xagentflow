@@ -77,11 +77,3 @@ This project implements a multi-agent financial research workflow using LangGrap
 *   The core planning and execution logic has been significantly debugged and refined.
 *   Agents interact more directly for step execution.
 *   Error handling within the workflow has been improved.
-*   **Known Issue:** The API endpoint for task creation (`/api/v1/tasks/`) was returning "Not Found" during recent tests. This needs further investigation in the FastAPI routing setup (`app/main.py` and `app/api/v1/endpoints/tasks.py`).
-
-## Development & Testing
-
-*   An isolated test script (`tests/test_execution.py`) can be used to test agent interaction and step execution logic without involving the full API and background task machinery. Activate the virtual environment and run:
-    ```bash
-    python tests/test_execution.py
-    ```
