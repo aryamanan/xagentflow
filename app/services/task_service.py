@@ -21,8 +21,8 @@ class TaskService:
     async def start_task(self, task_create: TaskCreate) -> UUID:
         logger.info(f"Starting task with type: {task_create.task_type}")
         
-        # Create task in memory
-        task = await crud_task.create_task(None, task_create)
+        # Create task in database
+        task = await crud_task.create_task(self.db, task_create)
         logger.info(f"Created task with ID: {task.id}")
         
         # Prepare initial state for workflow
@@ -42,13 +42,13 @@ class TaskService:
         try:
             logger.info(f"Creating workflow for task type: {task_create.task_type}")
             if task_create.task_type == TaskType.RESEARCH:
-                workflow = ResearchWorkflow(task.id, None)
+                workflow = ResearchWorkflow(task.id, self.db)
                 logger.info("Created ResearchWorkflow")
             elif task_create.task_type == TaskType.STRATEGY_DEV:
-                workflow = StrategyWorkflow(task.id, None)
+                workflow = StrategyWorkflow(task.id, self.db)
                 logger.info("Created StrategyWorkflow")
             elif task_create.task_type == TaskType.BACKTEST:
-                workflow = BacktestWorkflow(task.id, None)
+                workflow = BacktestWorkflow(task.id, self.db)
                 logger.info("Created BacktestWorkflow")
             else:
                 logger.error(f"Unsupported task type: {task_create.task_type}")
@@ -62,7 +62,7 @@ class TaskService:
             error_msg = f"Configuration error: {str(e)}"
             logger.error(error_msg)
             await crud_task.update_task_status(
-                None,
+                self.db,
                 task.id,
                 TaskStatus.FAILED,
                 error_details=error_msg
@@ -72,7 +72,7 @@ class TaskService:
             error_msg = f"Workflow instantiation failed: {str(e)}"
             logger.error(error_msg)
             await crud_task.update_task_status(
-                None,
+                self.db,
                 task.id,
                 TaskStatus.FAILED,
                 error_details=error_msg
@@ -82,60 +82,66 @@ class TaskService:
         return task.id
 
     async def approve_task_plan(self, task_id: UUID, approval: PlanApproval) -> None:
-        """Approve or reject a task's plan."""
-        logger.info(f"Processing plan approval for task {task_id}")
+        """Approve or reject a task's plan. Runs workflow SYNCHRONOUSLY for debugging."""
+        logger.info(f"[Task {task_id}] Entered approve_task_plan. Approval value: {approval.approved}")
         
         # Get current task state
-        task = await crud_task.get_task(None, task_id)
+        logger.info(f"[Task {task_id}] approve_task_plan: Getting task...")
+        task = await crud_task.get_task(self.db, task_id)
         if not task:
-            logger.error(f"Task {task_id} not found")
+            logger.error(f"[Task {task_id}] approve_task_plan: Task not found")
             raise HTTPException(404, "Task not found")
+        logger.info(f"[Task {task_id}] approve_task_plan: Task found. Current status: {task.status}")
             
         if task.status != TaskStatus.PENDING_APPROVAL:
-            logger.error(f"Task {task_id} is not in PENDING_APPROVAL state")
+            logger.error(f"[Task {task_id}] approve_task_plan: Task not in PENDING_APPROVAL state")
             raise HTTPException(400, "Task is not in pending approval state")
+        logger.info(f"[Task {task_id}] approve_task_plan: Task status is PENDING_APPROVAL.")
             
         if not approval.approved:
-            logger.info(f"Plan rejected for task {task_id}")
+            logger.info(f"[Task {task_id}] approve_task_plan: Plan rejected by user.")
             await crud_task.update_task_status(
-                None,
+                self.db,
                 task_id,
                 TaskStatus.REJECTED,
                 error_details="Plan rejected by user"
             )
+            logger.info(f"[Task {task_id}] approve_task_plan: Updated DB status to REJECTED.")
             return
             
-        logger.info(f"Plan approved for task {task_id}. Resuming workflow...")
-        await crud_task.update_task_status(None, task_id, TaskStatus.IN_PROGRESS)
+        logger.info(f"[Task {task_id}] approve_task_plan: Plan approved. Updating status...")
+        await crud_task.update_task_status(self.db, task_id, TaskStatus.IN_PROGRESS)
+        logger.info(f"[Task {task_id}] Status updated to IN_PROGRESS in DB.")
         
-        # Resume workflow execution in the background
-        asyncio.create_task(self._resume_workflow_background(task_id, task.task_type))
-
-    async def _resume_workflow_background(self, task_id: str, task_type: TaskType):
-        """Helper to resume workflow in the background after approval."""
-        logger.info(f"Resuming workflow for task {task_id}")
+        # --- Run workflow execution SYNCHRONOUSLY --- 
         try:
-            # Re-instantiate the workflow
-            if task_type == TaskType.RESEARCH:
-                workflow = ResearchWorkflow(task_id, None)
-                logger.info("Created ResearchWorkflow for resume")
-            elif task_type == TaskType.STRATEGY_DEV:
-                workflow = StrategyWorkflow(task_id, None)
-                logger.info("Created StrategyWorkflow for resume")
-            elif task_type == TaskType.BACKTEST:
-                workflow = BacktestWorkflow(task_id, None)
-                logger.info("Created BacktestWorkflow for resume")
+            logger.info(f"[Task {task_id}] Attempting to run workflow SYNCHRONOUSLY...") 
+            
+            # Re-instantiate the workflow directly
+            logger.info(f"[Task {task_id}] Re-instantiating workflow for synchronous run...")
+            if task.task_type == TaskType.RESEARCH:
+                workflow = ResearchWorkflow(task_id, self.db)
+                logger.info(f"[Task {task_id}] Created ResearchWorkflow for synchronous run")
+            elif task.task_type == TaskType.STRATEGY_DEV:
+                workflow = StrategyWorkflow(task_id, self.db)
+                logger.info(f"[Task {task_id}] Created StrategyWorkflow for synchronous run")
+            elif task.task_type == TaskType.BACKTEST:
+                workflow = BacktestWorkflow(task_id, self.db)
+                logger.info(f"[Task {task_id}] Created BacktestWorkflow for synchronous run")
             else:
-                logger.error(f"Unsupported task type for resume: {task_type}")
-                raise ValueError(f"Unsupported task type for resume: {task_type}")
+                logger.error(f"[Task {task_id}] Unsupported task type for synchronous run: {task.task_type}")
+                raise ValueError(f"Unsupported task type for synchronous run: {task.task_type}")
 
-            logger.info(f"Resuming workflow for task {task_id}...")
-            final_state = await workflow.resume()
-            logger.info(f"Workflow for task {task_id} finished resuming. Final state keys: {final_state.keys() if final_state else 'None'}")
+            logger.info(f"[Task {task_id}] Calling workflow.resume() synchronously...")
+            final_state = await workflow.resume() # Execute directly
+            logger.info(f"[Task {task_id}] workflow.resume() finished synchronously. Final state keys: {final_state.keys() if final_state else 'None'}")
 
         except Exception as e:
-            logger.error(f"Error resuming workflow for task {task_id}: {e}")
-            await crud_task.update_task_status(None, task_id, TaskStatus.FAILED, f"Workflow resume failed: {e}")
+            logger.error(f"[Task {task_id}] FAILED during synchronous workflow run: {str(e)}", exc_info=True) 
+            await crud_task.update_task_status(self.db, task_id, TaskStatus.FAILED, f"Workflow resume failed: {e}")
+        # --- End Synchronous Execution --- 
+
+        logger.info(f"[Task {task_id}] Exiting approve_task_plan function after synchronous run.") 
 
     async def _run_workflow_background(self, workflow, initial_state, task_id):
         """Helper to run the initial workflow execution in the background."""
@@ -151,36 +157,43 @@ class TaskService:
                 if final_state and final_state.get("error_info"):
                     error_msg = str(final_state["error_info"].get("error", "Unknown error"))
                     logger.error(f"Workflow execution failed for task {task_id}: {error_msg}")
-                    await crud_task.update_task_status(None, task_id, TaskStatus.FAILED, error_msg)
+                    await crud_task.update_task_status(self.db, task_id, TaskStatus.FAILED, error_msg)
                 else:
-                    # Check if we're stopping for approval
-                    if final_state and final_state.get("stop_for_approval"):
-                        logger.info(f"Workflow paused for approval for task {task_id}")
-                        # Status should already be PENDING_APPROVAL from the workflow
-                    elif final_state and final_state.get("status") == TaskStatus.PENDING_APPROVAL:
-                        logger.info(f"Workflow paused for approval for task {task_id}")
-                        # Status should already be PENDING_APPROVAL from the workflow
+                    # Check if we have a plan that needs approval
+                    if final_state and final_state.get("current_plan"):
+                        logger.info(f"Plan generated for task {task_id}, waiting for approval")
+                        # Save the plan to the task
+                        await crud_task.update_task_plan(
+                            self.db,
+                            task_id,
+                            final_state["current_plan"]
+                        )
+                        # Update status to pending approval
+                        await crud_task.update_task_status(
+                            self.db,
+                            task_id,
+                            TaskStatus.PENDING_APPROVAL
+                        )
                     else:
-                        # Only mark as completed if we're not waiting for approval
-                        task = await crud_task.get_task(None, task_id)
-                        if task and task.status != TaskStatus.PENDING_APPROVAL:
-                            logger.info(f"Workflow execution successful for task {task_id}")
-                            await crud_task.update_task_status(None, task_id, TaskStatus.COMPLETED)
-                    
+                        # No plan was generated
+                        error_msg = "No plan was generated by the workflow"
+                        logger.error(f"Workflow failed for task {task_id}: {error_msg}")
+                        await crud_task.update_task_status(self.db, task_id, TaskStatus.FAILED, error_msg)
+                
             except Exception as workflow_err:
                 error_msg = str(workflow_err)
                 logger.error(f"Workflow background task failed for task {task_id}: {error_msg}")
-                await crud_task.update_task_status(None, task_id, TaskStatus.FAILED, error_msg)
+                await crud_task.update_task_status(self.db, task_id, TaskStatus.FAILED, error_msg)
 
         except Exception as e:
             logger.error(f"Error in workflow background task for {task_id}: {str(e)}")
-            await crud_task.update_task_status(None, task_id, TaskStatus.FAILED, str(e))
+            await crud_task.update_task_status(self.db, task_id, TaskStatus.FAILED, str(e))
 
     async def get_task(self, task_id: UUID) -> TaskResponse:
         """Get a task by ID."""
         logger.debug(f"Getting task with ID: {task_id}")
         try:
-            task = await crud_task.get_task(None, task_id)
+            task = await crud_task.get_task(self.db, task_id)
             if not task:
                 logger.error(f"Task not found: {task_id}")
                 raise HTTPException(404, "Task not found")
@@ -196,11 +209,11 @@ class TaskService:
         limit: int = 100
     ) -> TaskList:
         """List tasks with filtering."""
-        tasks = await crud_task.list_tasks_filtered(None, filter_params, skip, limit)
+        tasks = await crud_task.list_tasks_filtered(self.db, filter_params, skip, limit)
         total = len(tasks)
         return TaskList(items=tasks, total=total)
 
     async def list_tasks(self) -> List[TaskResponse]:
         """List all tasks without filtering."""
-        tasks = await crud_task.list_tasks(None)
+        tasks = await crud_task.list_tasks(self.db)
         return tasks

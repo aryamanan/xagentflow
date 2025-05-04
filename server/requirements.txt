@@ -6,6 +6,7 @@ uvicorn[standard]
 python-dotenv
 pydantic
 pydantic-settings
+python-decouple
 
 # Agent Frameworks
 langchain
@@ -25,7 +26,6 @@ llama-index-vector-stores-chroma # Example vector store, adjust as needed (e.g.,
 llama-index-readers-file
 
 # Data Layer (PostgreSQL + SQLAlchemy Async)
-database_url # For parsing DATABASE_URL
 sqlalchemy[asyncio]
 asyncpg # Async driver for PostgreSQL
 alembic # For database migrations (optional but recommended)
@@ -39,7 +39,7 @@ pandas-ta # For Technical Indicators
 vectorbt # For Backtesting
 # backtrader # Alternative backtesting library
 # zipline-reloaded # Alternative backtesting library (may have complex dependencies)
-skopt # For scikit-optimize (Bayesian Optimization)
+scikit-optimize # For Bayesian Optimization
 # optuna # Alternative hyperparameter optimization library
 scikit-learn # For Grid Search and other ML utilities
 numpy

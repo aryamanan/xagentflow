@@ -243,7 +243,7 @@ class StrategyWorkflow:
         self.coordinator = create_coordinator_agent()
         
         # Initialize memory saver
-        self.memory_saver = MemorySaver(task_id)
+        self.memory_saver = MemorySaver()
         
         # Build workflow graph
         self.graph = self._build_graph()

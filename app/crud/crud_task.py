@@ -87,15 +87,16 @@ async def update_task_plan(
 ) -> Optional[Task]:
     """Update a task's plan."""
     logger.debug(f"Updating task {task_id} plan")
-    task = await get_task(db, task_id)
+    task_id_str = str(task_id) if isinstance(task_id, UUID) else task_id
+    task = tasks.get(task_id_str)
     if not task:
         logger.debug(f"Task not found for plan update: {task_id}")
         return None
         
     task.plan = plan
-    task.status = TaskStatus.PENDING_APPROVAL
     task.updated_at = datetime.utcnow()
-    logger.debug(f"Updated task plan: {task.id}, status: {task.status}")
+    
+    logger.debug(f"Updated task plan: {task.id}")
     return task
 
 async def list_tasks(db: Any) -> List[Task]:
