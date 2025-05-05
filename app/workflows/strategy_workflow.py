@@ -5,7 +5,6 @@ from langgraph.checkpoint.memory import MemorySaver
 from app.agents import (
     create_planner_agent,
     create_strategy_agent,
-    create_coordinator_agent
 )
 from app.models.task import TaskStatus
 from app.crud import task as crud_task
@@ -240,7 +239,6 @@ class StrategyWorkflow:
         # Initialize agents
         self.planner = create_planner_agent()
         self.strategist = create_strategy_agent()
-        self.coordinator = create_coordinator_agent()
         
         # Initialize memory saver
         self.memory_saver = MemorySaver()

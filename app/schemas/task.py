@@ -22,6 +22,7 @@ class TaskUpdate(BaseModel):
     output_data: Optional[Dict[str, Any]] = None
     plan: Optional[Dict[str, Any]] = None
     error_details: Optional[str] = None
+    checkpoint_data: Optional[str] = None
 
 class TaskResponse(TaskBase):
     """Task Response Schema"""

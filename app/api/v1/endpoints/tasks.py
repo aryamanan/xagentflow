@@ -29,7 +29,23 @@ async def get_task(
     task_service: TaskService = Depends(get_task_service)
 ) -> TaskResponse:
     """Get a specific task by ID."""
-    return await task_service.get_task(task_id)
+    try:
+        task = await task_service.get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail="Task not found")
+        return task
+    except ValueError as ve: # Assuming TaskService.get_task might raise ValueError for bad ID format or similar
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        # Catch potential specific exceptions from TaskService if it raises them for not found
+        # For now, assume a generic exception could mean not found or other issues.
+        # Re-check TaskService implementation if specific exceptions are used.
+        logger.error(f"Error getting task {task_id}: {e}")
+        # Check if the error message indicates 'not found' (adjust if needed)
+        if "not found" in str(e).lower():
+             raise HTTPException(status_code=404, detail="Task not found")
+        # Otherwise, return a generic 500
+        raise HTTPException(status_code=500, detail="Internal server error while retrieving task")
 
 @router.get("/", response_model=TaskList)
 async def list_tasks(

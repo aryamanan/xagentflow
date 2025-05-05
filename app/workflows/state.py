@@ -15,9 +15,17 @@ class ToolUsage(TypedDict):
     output: Optional[Dict[str, Any]]
     error: Optional[str]
 
-class WorkflowState(dict):
-    """State management for research workflow."""
-    
+class WorkflowState(TypedDict):
+    """Represents the state of the research workflow."""
+    task_id: str
+    initial_request: Dict[str, Any] # Original request that started the task
+    current_plan: Optional[List[Dict[str, Any]]] # The approved plan
+    current_step_index: int # 0-based index of the step being executed or about to be
+    plan_approved: bool # Flag indicating if the plan is approved for execution
+    step_outputs: Dict[int, Any] # Stores outputs for each step index
+    final_result: Optional[Dict[str, Any]] # Final output data for the task
+    error_info: Optional[Dict[str, Any]] # Details if an error occurred
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setdefault("status", TaskStatus.PLANNING)
@@ -247,21 +255,3 @@ class WorkflowState(dict):
             "validation_errors": self["validation_errors"],
             "retry_count": self["retry_count"]
         }
-
-class WorkflowState(TypedDict):
-    """Type definition for workflow state."""
-    task_id: Union[UUID, str]
-    task_type: str
-    initial_request: Dict[str, Any]
-    input_data: Dict[str, Any]
-    current_step_index: int
-    current_plan: Optional[Dict[str, Any]]
-    plan_approved: bool
-    agent_inputs: Dict[str, Any]
-    agent_outputs: Dict[str, Any]
-    intermediate_results: Dict[str, Any]
-    final_result: Optional[Dict[str, Any]]
-    error_info: Optional[Dict[str, Any]]
-    metadata: Dict[str, Any]
-    status: str
-    retry_count: int

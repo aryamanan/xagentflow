@@ -23,7 +23,7 @@ class BaseAgent:
         if not settings.GEMINI_API_KEY or settings.GEMINI_API_KEY == "your-gemini-api-key":
             raise ValueError("GEMINI_API_KEY not properly configured")
         genai.configure(api_key=settings.GEMINI_API_KEY)
-        self.model = genai.GenerativeModel('gemini-1.5-flash')
+        self.model = genai.GenerativeModel('gemini-2.0-flash')
         self.name = name
         self.description = description
         logger.debug(f"BaseAgent {name} initialized successfully")
@@ -40,6 +40,8 @@ class BaseAgent:
         """
         try:
             logger.debug(f"[{self.name}] Generating response with event loop: {id(asyncio.get_event_loop())}")
+            logger.info(f"[{self.name}] Waiting 15s before LLM call to avoid rate limits...")
+            await asyncio.sleep(15)
             current_loop = asyncio.get_event_loop()
             logger.debug(f"[{self.name}] Current loop running: {current_loop.is_running()}, closed: {current_loop.is_closed()}")
             

@@ -34,6 +34,7 @@ class Task:
         self.output_data = None
         self.plan = None
         self.error_details = None
+        self.checkpoint_data: Optional[str] = None
         self.created_at = datetime.utcnow()
         self.updated_at = datetime.utcnow()
         self.completed_at = None

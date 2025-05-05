@@ -2,6 +2,7 @@ import logging
 import aiohttp
 import pandas as pd
 import numpy as np
+import json
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
 from app.core.config import settings
@@ -15,26 +16,52 @@ async def fetch_historical_data(symbol: str, period: str = "1y", interval: str =
     """
     logger.info("fetching_historical_data", symbol=symbol, period=period, interval=interval)
     
-    async with aiohttp.ClientSession() as session:
-        try:
-            headers = {
-                "X-API-KEY": settings.EXTERNAL_MARKET_DATA_API_KEY,
-                "Content-Type": "application/json"
-            }
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Ensure API Key and URL are loaded correctly
+            api_key = settings.EXTERNAL_MARKET_DATA_API_KEY
+            api_url_base = settings.EXTERNAL_MARKET_DATA_API_URL
+            if not api_key:
+                logger.error("EXTERNAL_MARKET_DATA_API_KEY is not set in settings")
+                return {"ticker": symbol, "status": "error", "error": "API key not configured"}
+            if not api_url_base:
+                logger.error("EXTERNAL_MARKET_DATA_API_URL is not set in settings")
+                return {"ticker": symbol, "status": "error", "error": "API URL not configured"}
+
+            headers = {"X-API-KEY": api_key, "Content-Type": "application/json"}
+            url = f"https://{api_url_base.rstrip('/')}/v8/finance/chart/{symbol}"
+            params = {"range": period, "interval": interval, "events": "div,splits"}
             
-            # Format the API URL
-            url = f"https://{settings.EXTERNAL_MARKET_DATA_API_URL}/v8/finance/chart/{symbol}"
-            
-            params = {
-                "range": period,
-                "interval": interval,
-                "events": "div,splits"
-            }
+            logger.debug("Calling yfapi.net", url=url, params=params)
             
             async with session.get(url, headers=headers, params=params) as response:
-                response.raise_for_status()
-                data = await response.json()
+                logger.info("yfapi.net response received", status_code=response.status, url=response.url)
                 
+                # Read response text regardless of status for debugging
+                response_text = await response.text()
+                
+                # Check status code *after* reading text
+                if response.status != 200:
+                    logger.error("yfapi.net API error", 
+                               status=response.status, 
+                               response_preview=response_text[:500])
+                    return {
+                        "ticker": symbol,
+                        "status": "error",
+                        "error": f"API request failed with status {response.status}: {response_text[:100]}"
+                    }
+
+                try:
+                    data = json.loads(response_text)
+                except json.JSONDecodeError as json_err:
+                    logger.error("JSON decoding failed", 
+                               error=str(json_err),
+                               response_preview=response_text[:500])
+                    return {"ticker": symbol, "status": "error", "error": f"Failed to decode API JSON response: {json_err}"}
+
+                logger.debug("Raw JSON structure received", 
+                           keys=list(data.keys()) if isinstance(data, dict) else 'Not a dict')
+
                 # Extract the time series data
                 chart = data.get("chart", {})
                 result = chart.get("result", [{}])[0]
@@ -47,16 +74,40 @@ async def fetch_historical_data(symbol: str, period: str = "1y", interval: str =
                 # Extract OHLCV data
                 formatted_data = []
                 for i, timestamp in enumerate(timestamps):
-                    formatted_data.append({
-                        "date": datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S"),
-                        "open": float(quote.get("open", [])[i]),
-                        "high": float(quote.get("high", [])[i]),
-                        "low": float(quote.get("low", [])[i]),
-                        "close": float(quote.get("close", [])[i]),
-                        "volume": int(quote.get("volume", [])[i])
-                    })
-                
-                logger.info("historical_data_fetched", symbol=symbol, status="success")
+                    try:
+                        # Get values defensively
+                        o = quote.get("open", [])[i]
+                        h = quote.get("high", [])[i]
+                        l = quote.get("low", [])[i]
+                        c = quote.get("close", [])[i]
+                        v = quote.get("volume", [])[i]
+
+                        # Check for None explicitly *before* float/int conversion
+                        if any(val is None for val in [o, h, l, c, v]):
+                            logger.warning("Found None value in source data", 
+                                         timestamp=timestamp, 
+                                         index=i)
+                            continue
+
+                        formatted_data.append({
+                            "date": datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+                            "open": float(o),
+                            "high": float(h),
+                            "low": float(l),
+                            "close": float(c),
+                            "volume": int(v)
+                        })
+                    except (TypeError, ValueError, IndexError) as format_error:
+                        logger.error("Error formatting data point", 
+                                   index=i,
+                                   timestamp=timestamp,
+                                   error=str(format_error))
+                        continue
+
+                logger.info("historical_data_fetched", 
+                          symbol=symbol,
+                          status="success",
+                          data_points=len(formatted_data))
                 return {
                     "ticker": symbol,
                     "period": period,
@@ -64,23 +115,30 @@ async def fetch_historical_data(symbol: str, period: str = "1y", interval: str =
                     "data": formatted_data,
                     "status": "success"
                 }
-                
-        except Exception as e:
-            logger.error("historical_data_error", 
-                        symbol=symbol, 
-                        error=str(e),
-                        error_type=type(e).__name__)
-            return {
-                "ticker": symbol,
-                "status": "error",
-                "error": str(e)
-            }
+
+    except aiohttp.ClientError as client_error:
+        logger.error("Network/Client error", 
+                    symbol=symbol,
+                    error=str(client_error))
+        return {"ticker": symbol, "status": "error", "error": f"Network/Client error: {client_error}"}
+    except Exception as e:
+        logger.error("Unexpected error in fetch_historical_data", 
+                    symbol=symbol,
+                    error=str(e),
+                    error_type=type(e).__name__)
+        return {
+            "ticker": symbol,
+            "status": "error",
+            "error": f"Unexpected error in fetch_historical_data: {str(e)}"
+        }
 
 async def calculate_technical_indicators(data: List[Dict[str, Any]], indicators: List[str]) -> Dict[str, Any]:
     """
     Calculate technical indicators using real market data
     """
     logger.info("calculating_indicators", indicators=indicators)
+    logger.debug("Input data points", count=len(data))
+    
     try:
         # data IS the list of dictionaries now
         if not data:
@@ -108,6 +166,7 @@ async def calculate_technical_indicators(data: List[Dict[str, Any]], indicators:
         
         # Calculate RSI
         if 'rsi' in [ind.lower() for ind in indicators]:
+            logger.debug("Calculating RSI")
             if len(df) >= 15: # Need enough data for rolling window + diff
                  delta = df['close'].diff()
                  gain = (delta.where(delta > 0, 0)).rolling(window=14, min_periods=1).mean()
@@ -122,6 +181,7 @@ async def calculate_technical_indicators(data: List[Dict[str, Any]], indicators:
 
         # Calculate MACD
         if 'macd' in [ind.lower() for ind in indicators]:
+            logger.debug("Calculating MACD")
             if len(df) >= 26: # Need enough data for longest EMA
                  exp1 = df['close'].ewm(span=12, adjust=False).mean()
                  exp2 = df['close'].ewm(span=26, adjust=False).mean()
@@ -138,6 +198,7 @@ async def calculate_technical_indicators(data: List[Dict[str, Any]], indicators:
 
         # Calculate Bollinger Bands
         if 'bollinger' in [ind.lower() for ind in indicators]:
+            logger.debug("Calculating Bollinger Bands")
             if len(df) >= 20: # Need enough data for rolling window
                  sma = df['close'].rolling(window=20, min_periods=1).mean()
                  std = df['close'].rolling(window=20, min_periods=1).std()
@@ -153,36 +214,39 @@ async def calculate_technical_indicators(data: List[Dict[str, Any]], indicators:
         # Add other indicators here following the pattern (e.g., SMA, EMA)
         if 'sma' in [ind.lower() for ind in indicators]:
              # Example: Calculate 50-day SMA
+             logger.debug("Calculating SMA")
              if len(df) >= 50:
-                 results['sma_50'] = df['close'].rolling(window=50, min_periods=1).mean().bfill().ffill().tolist() # Updated fillna
+                 results['sma_50'] = df['close'].rolling(window=50, min_periods=1).mean().bfill().ffill().tolist()
              else:
                  logger.warning("Not enough data to calculate 50-day SMA (need >= 50 rows)")
                  results['sma_50'] = []
 
         if 'ema' in [ind.lower() for ind in indicators]:
              # Example: Calculate 20-day EMA
+             logger.debug("Calculating EMA")
              if len(df) >= 20:
                  results['ema_20'] = df['close'].ewm(span=20, adjust=False).mean().tolist()
              else:
                  logger.warning("Not enough data to calculate 20-day EMA (need >= 20 rows)")
                  results['ema_20'] = []
         
-        logger.info("indicators_calculated", status="success", indicators=list(results.keys()))
+        logger.info("indicators_calculated", 
+                   status="success",
+                   indicators=list(results.keys()))
         return {
             "status": "success",
-            "indicators": results
+            "data": {
+                "input_length": len(data),
+                "indicators": results
+            }
         }
         
     except Exception as e:
         logger.error("indicator_calculation_error", 
                     error=str(e),
                     error_type=type(e).__name__,
-                    exc_info=True) # Log traceback
-        # Return error status instead of raising
-        return {
-            "status": "error",
-            "error": f"Indicator calculation failed: {str(e)}"
-        }
+                    exc_info=True)
+        return {"status": "error", "error": f"Failed to calculate indicators: {str(e)}"}
 
 async def optimize_strategy_parameters(
     strategy_type: str,

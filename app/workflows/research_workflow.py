@@ -1,11 +1,11 @@
 from typing import Dict, Any, Optional, List
 from uuid import UUID
 from langgraph.graph import StateGraph, END, START
-from langgraph.checkpoint.memory import MemorySaver
+
 from app.agents import (
     create_planner_agent,
-    create_research_agent,
-    create_coordinator_agent
+    # create_research_agent,
+    # create_coordinator_agent
 )
 from app.crud import crud_task
 from app.models.task import TaskStatus
@@ -17,6 +17,24 @@ import json
 import asyncio
 import concurrent.futures
 import functools
+
+# --- Import Tool Registry --- 
+from app.tools.registry import workflow_tools
+# --- End Import ---
+from app.tools.financial_tools import (
+    fetch_historical_data,
+    calculate_technical_indicators
+)
+from app.tools.knowledge_tools import query_local_kb
+from app.core.config import settings
+# --- Remove OpenAI Import --- 
+# from langchain_openai import ChatOpenAI
+# --- End Removal ---
+from langchain_core.messages import HumanMessage
+
+# --- Add direct Gemini import ---
+from langchain_google_genai import ChatGoogleGenerativeAI
+# --- End Import --- 
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +55,18 @@ def run_async_in_thread(coro):
         loop.close()
         asyncio.set_event_loop(None)
         logger.debug("Thread event loop closed and removed")
+
+# Custom JSON encoder to handle non-serializable types
+def state_serializer(obj):
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, TaskStatus):
+        return obj.value
+    # Add other type handlers if necessary
+    try:
+        return str(obj) # Fallback for other complex types
+    except Exception:
+        return f"<unserializable:{type(obj).__name__}>"
 
 # Define node functions without decorators
 async def generate_plan_node(state: WorkflowState, planner, db_session, task_id) -> WorkflowState:
@@ -63,6 +93,9 @@ async def generate_plan_node(state: WorkflowState, planner, db_session, task_id)
                     raise ValueError("Stored plan contains no steps")
                 state["current_plan"] = plan
                 state["status"] = TaskStatus.IN_PROGRESS
+                # --- Add logging ---
+                logger.info(f"[Task {task_id}] generate_plan_node: Detected existing approved plan. Skipping generation. State status: {state['status']}")
+                # --- End logging ---
                 return state
             except Exception as e:
                 logger.error(f"[Task {task_id}] Error validating existing plan: {str(e)}")
@@ -97,18 +130,43 @@ async def generate_plan_node(state: WorkflowState, planner, db_session, task_id)
                 if not steps:
                     raise ValueError("Generated plan contains no steps")
                 
-                # Update task with the full plan_result
-                await crud_task.update_task_plan(db_session, task_id, plan_result)
+                # --- Extract the inner plan --- 
+                inner_plan = plan_result.get("plan")
+                if not inner_plan:
+                    raise ValueError("Planner result missing 'plan' key after validation")
+                # --- End Extraction ---
                 
-                # Update state with the full plan_result
-                state["current_plan"] = plan_result
+                # --- Update task and state with the INNER plan --- 
+                await crud_task.update_task_plan(db_session, task_id, inner_plan)
+                state["current_plan"] = inner_plan 
+                # --- End Update ---
+                
                 state["stop_for_approval"] = True
                 state["status"] = TaskStatus.PENDING_APPROVAL
                 
-                # Update task status
+                # --- Save Checkpoint Data --- 
+                try:
+                    checkpoint_json = json.dumps(state, default=state_serializer)
+                    logger.info(f"[Task {task_id}] Serialized state for checkpoint.")
+                    await crud_task.update_task(
+                        db_session,
+                        task_id,
+                        TaskUpdate(checkpoint_data=checkpoint_json)
+                    )
+                    logger.info(f"[Task {task_id}] Saved checkpoint data to DB.")
+                except Exception as cp_err:
+                    logger.error(f"[Task {task_id}] FAILED TO SAVE CHECKPOINT DATA: {str(cp_err)}", exc_info=True)
+                    # Decide if this should fail the task or just log
+                    state["error_info"] = {"step": "generate_plan", "error": f"Failed to save checkpoint: {str(cp_err)}"}
+                    state["status"] = TaskStatus.FAILED
+                    await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, f"Failed to save checkpoint: {str(cp_err)}")
+                    return state
+                # --- End Save Checkpoint Data ---
+
+                # Update task status *after* saving checkpoint
                 await crud_task.update_task_status(db_session, task_id, TaskStatus.PENDING_APPROVAL)
                 
-                logger.info(f"[Task {task_id}] Plan generated successfully")
+                logger.info(f"[Task {task_id}] Plan generated successfully, checkpoint saved.")
                 return state
                 
             except Exception as e:
@@ -230,166 +288,262 @@ def _extract_steps(plan: Dict[str, Any]) -> List[Dict[str, Any]]:
     
     return normalized_steps
 
-async def execute_step_node(state: WorkflowState, coordinator, researcher, db_session, task_id) -> WorkflowState:
-    """Execute a single step in the workflow."""
+# --- Refactored execute_step Node --- 
+async def execute_step(state: WorkflowState, workflow_instance: 'ResearchWorkflow', db_session, task_id: UUID) -> WorkflowState:
+    """Execute a single step by calling tools or LLM directly."""
     current_index = state.get("current_step_index", 0)
-    logger.info(f"[Task {task_id}] Executing step {current_index}")
-    
-    # --- Plan Structure Validation ---
-    current_plan = state.get("current_plan")
-    if not current_plan:
-        logger.error(f"[Task {task_id}] No plan found in state")
-        state["error_info"] = {"step": "execute_step", "error": "No plan found in state"}
-        await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, "No plan found in state")
-        return state
-    
-    # Handle string plans
-    if isinstance(current_plan, str):
-        try:
-            current_plan = json.loads(current_plan)
-            state["current_plan"] = current_plan
-        except json.JSONDecodeError:
-            logger.error(f"[Task {task_id}] Invalid JSON string in plan")
-            state["error_info"] = {"step": "execute_step", "error": "Invalid JSON string in plan"}
-            await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, "Invalid JSON string in plan")
-            return state
-    
-    if not isinstance(current_plan, dict):
-        logger.error(f"[Task {task_id}] Plan must be a dictionary")
-        state["error_info"] = {"step": "execute_step", "error": "Plan must be a dictionary"}
-        await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, "Plan must be a dictionary")
-        return state
-    
-    # Try multiple possible plan structures
-    plan_root = current_plan
-    workflow_plan = (
-        plan_root.get("plan", {}).get("WorkflowPlan", {})  # Original expected structure
-        or plan_root.get("plan", {})                       # Current structure
-        or plan_root                                       # Direct structure
-    )
-    
-    steps = (
-        workflow_plan.get("Steps")
-        or workflow_plan.get("steps")                      # Try lowercase
-        or []                                              # Default to empty
-    )
-    
-    # Log the plan structure for debugging
-    logger.debug(f"[Task {task_id}] Plan structure: {json.dumps(current_plan, indent=2)}")
-    logger.debug(f"[Task {task_id}] Found steps: {json.dumps(steps, indent=2)}")
-    
-    if not steps:
-        logger.error(f"[Task {task_id}] No steps found in plan")
-        state["error_info"] = {"step": "execute_step", "error": "Plan contains no steps"}
-        await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, "Plan contains no steps")
-        return state
-    
-    if not isinstance(steps, list):
-        logger.error(f"[Task {task_id}] Steps must be a list")
-        state["error_info"] = {"step": "execute_step", "error": "Steps must be a list"}
-        await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, "Steps must be a list")
-        return state
-    
-    if current_index >= len(steps):
-        logger.error(f"[Task {task_id}] Step index {current_index} out of range (total steps: {len(steps)})")
-        state["error_info"] = {"step": "execute_step", "error": f"Step index {current_index} out of range"}
-        await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, f"Step index {current_index} out of range")
-        return state
+    logger.info(f"[Task {task_id} / execute_step] >>> ENTERING node for step index {current_index}")
     
     try:
-        # Update task status to IN_PROGRESS if not already
+        # --- Get Current Step --- 
+        current_plan = state.get("current_plan")
+        if not current_plan:
+            raise ValueError("No plan found in state")
+        
+        steps = _extract_steps(current_plan)
+        if not steps:
+            raise ValueError("Plan contains no steps")
+        
+        if current_index >= len(steps):
+            raise ValueError(f"Invalid step index {current_index} (total steps: {len(steps)})")
+            
+        current_step = steps[current_index]
+        step_number = current_step["step_number"]
+        step_name = current_step["step_name"]
+        step_tools = current_step.get("tools", [])
+        step_description = current_step.get("description", "")
+        logger.info(f"[Task {task_id} / execute_step] Executing step {step_number}: {step_name} (Index: {current_index})")
+        logger.debug(f"[Task {task_id} / execute_step] Step details: {json.dumps(current_step, indent=2, default=state_serializer)}")
+
+        # --- Initialize state storage --- 
+        if "agent_outputs" not in state: state["agent_outputs"] = {}
+        if "intermediate_results" not in state: state["intermediate_results"] = {}
+
+        # --- Check Dependencies --- 
+        dependencies = current_step.get("dependencies", [])
+        logger.info(f"[Task {task_id} / execute_step] Checking dependencies: {dependencies}")
+        for dep in dependencies:
+            dep_index = dep - 1
+            dep_key = f"step_{dep_index}"
+            if dep_key not in state["agent_outputs"]:
+                raise ValueError(f"Missing dependency result for step {dep} (key: {dep_key})")
+            
+            dep_result = state["agent_outputs"][dep_key]
+            dep_status = dep_result.get("status") if isinstance(dep_result, dict) else None
+            if dep_status not in ["success", "completed_by_llm"]:
+                raise ValueError(f"Dependency step {dep} (key: {dep_key}) did not succeed. Status: {dep_status}")
+        logger.info(f"[Task {task_id} / execute_step] Dependencies satisfied.")
+
+        # --- Update Task Status --- 
         task = await crud_task.get_task(db_session, task_id)
         if task and task.status != TaskStatus.IN_PROGRESS:
             await crud_task.update_task_status(db_session, task_id, TaskStatus.IN_PROGRESS)
-        
-        # Get current step
-        current_step = steps[current_index]
-        logger.info(f"[Task {task_id}] Executing {current_step.get('step_name', 'Unknown Step')} with inputs: {current_step}")
-        
-        # Execute step using coordinator and researcher
-        step_result = await coordinator.aexecute_step(
-            step=current_step,
-            researcher=researcher,
-            state=state
-        )
-        
-        logger.info(f"[Task {task_id}] Step {current_index} execution result:\n{json.dumps(step_result, indent=2)}")
 
-        # Update state with results
-        if "agent_outputs" not in state:
-            state["agent_outputs"] = {}
+        # --- Execute Step Action --- 
+        step_result = None
+        if step_tools: # If tools are specified, execute the first one
+            tool_name = step_tools[0]
+            logger.info(f"[Task {task_id} / execute_step] Step requires tool: '{tool_name}'")
+            # --- Use imported registry --- 
+            if tool_name not in workflow_tools:
+                raise ValueError(f"Tool '{tool_name}' not available in workflow registry.")
+            
+            tool_func = workflow_tools[tool_name]
+            # --- End registry use --- 
+            tool_args = {} # Prepare arguments based on tool and context
+            
+            # Argument preparation logic (example)
+            if tool_name == "fetch_historical_data":
+                symbol = state.get("input_data", {}).get("symbol", "AAPL") # Default or from input
+                tool_args = {"symbol": symbol, "period": "2y"} # Example fixed period
+            elif tool_name == "calculate_technical_indicators":
+                # --- Refined Logic: Find the output from the fetch_historical_data step --- 
+                historical_data_output = None
+                fetch_step_index = -1
+                
+                # Iterate through previous steps' outputs to find the data source
+                for dep_index in range(current_index):
+                    step_key = f"step_{dep_index}"
+                    prev_step_definition = steps[dep_index] # Get the definition of the previous step
+                    prev_step_tools = prev_step_definition.get("tools", [])
+                    
+                    if "fetch_historical_data" in prev_step_tools:
+                        # This step should have the data we need
+                        output = state["agent_outputs"].get(step_key)
+                        if output and output.get("status") == "success" and "data" in output:
+                            historical_data_output = output["data"]
+                            fetch_step_index = dep_index
+                            logger.info(f"[Task {task_id} / execute_step] Found historical data from step {dep_index + 1}")
+                            break # Found the data, no need to check further back
+                        else:
+                            logger.warning(f"[Task {task_id} / execute_step] Step {dep_index + 1} used fetch_historical_data but output is invalid or missing data: {output}")
+
+                if not historical_data_output:
+                    # If loop completes without finding data, raise error
+                    raise ValueError("Could not find valid historical data output from any previous fetch_historical_data step.")
+                
+                tool_args["data"] = historical_data_output
+                # --- End Refined Logic ---
+
+                # Extract indicators from description (simple example)
+                desc_lower = step_description.lower()
+                indicators_to_calc = []
+                if "rsi" in desc_lower: indicators_to_calc.append("rsi")
+                if "macd" in desc_lower: indicators_to_calc.append("macd")
+                if "sma" in desc_lower: indicators_to_calc.append("sma") # Added SMA
+                if "adx" in desc_lower: indicators_to_calc.append("adx") # Added ADX
+                tool_args["indicators"] = indicators_to_calc if indicators_to_calc else ["rsi", "macd"] # Default if none found
+            elif tool_name == "query_local_kb":
+                 tool_args = {"query": step_description} # Use description as query
+            
+            logger.info(f"[Task {task_id} / execute_step] Calling tool '{tool_name}' with args: {tool_args}")
+            try:
+                step_result = await tool_func(**tool_args)
+                # Ensure tool result has status
+                if isinstance(step_result, dict) and "status" not in step_result:
+                     logger.warning(f"Tool '{tool_name}' result missing 'status', assuming success.")
+                     step_result["status"] = "success" 
+                elif not isinstance(step_result, dict):
+                    logger.warning(f"Tool '{tool_name}' returned non-dict, wrapping as success.")
+                    step_result = {"status": "success", "result": step_result}
+            except Exception as tool_err:
+                 logger.error(f"[Task {task_id} / execute_step] Error calling tool '{tool_name}': {tool_err}", exc_info=True)
+                 step_result = {"status": "error", "error": f"Tool call failed: {str(tool_err)}"}
+
+        else: # No tools specified, use LLM for analysis/synthesis
+            logger.info(f"[Task {task_id} / execute_step] Step requires LLM generation.")
+            # Prepare prompt for LLM
+            prompt = f"""Execute the following research step based on the provided context:
+
+Step Number: {step_number}
+Step Name: {step_name}
+Description: {step_description}
+Success Criteria: {current_step.get('success_criteria', 'N/A')}
+
+Available Data from Previous Steps (agent_outputs):
+{json.dumps(state.get('agent_outputs', {}), indent=2, default=state_serializer)}
+
+Please perform the described task based *only* on the information provided. Provide a detailed report or summary as the result."""
+            
+            try:
+                logger.info(f"[Task {task_id} / execute_step] Calling LLM...")
+                # --- Add Delay ---
+                logger.info(f"[Task {task_id} / execute_step] Waiting 15s before LLM call to avoid rate limits...")
+                await asyncio.sleep(15)
+                # --- End Delay ---
+                llm_response = await workflow_instance.llm.ainvoke([HumanMessage(content=prompt)])
+                step_result = {"status": "completed_by_llm", "content": llm_response.content}
+                logger.info(f"[Task {task_id} / execute_step] LLM call successful.")
+            except Exception as llm_err:
+                logger.error(f"[Task {task_id} / execute_step] Error calling LLM: {llm_err}", exc_info=True)
+                step_result = {"status": "error", "error": f"LLM call failed: {str(llm_err)}"}
+
+        # --- Store Result --- 
+        loggable_result = json.dumps(step_result, indent=2, default=state_serializer)
+        logger.debug(f"[Task {task_id} / execute_step] Raw step result: {loggable_result}")
         state["agent_outputs"][f"step_{current_index}"] = step_result
-        
-        step_status = step_result.get("status") if isinstance(step_result, dict) else "error"
-        step_error = step_result.get("error") if isinstance(step_result, dict) else "Unknown execution result structure"
+        if isinstance(step_result, dict) and step_result.get("status") == "success" and "data" in step_result:
+             state["intermediate_results"][f"step_{current_index}"] = step_result["data"]
 
-        # Handle step outcome
-        if step_status == "completed":
-            state["current_step_index"] = current_index + 1
-            logger.info(f"[Task {task_id}] Successfully executed step {current_index}")
-            # Clear error info if the step was previously failed but now succeeded (e.g., on retry)
-            if state.get("error_info"):
-                 logger.info(f"[Task {task_id}] Clearing previous error_info after successful step {current_index}")
-                 state["error_info"] = None 
-        else:
-            # Log failure only if status indicates failure
-            logger.error(f"[Task {task_id}] Step {current_index} failed. Status: {step_status}, Error: {step_error}")
-            # Set error_info state - use the actual error message
-            state["error_info"] = {"step": f"execute_step_{current_index}", "error": step_error}
-            await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, step_error) # Update DB task status
+        # --- Handle Outcome --- 
+        step_status = step_result.get("status")
+        step_error = step_result.get("error")
+        logger.info(f"[Task {task_id} / execute_step] Outcome: Status='{step_status}', Error='{step_error}'")
         
-        # Update progress in task
+        if step_status in ["success", "completed_by_llm"]:
+            state["current_step_index"] = current_index + 1
+            logger.info(f"[Task {task_id} / execute_step] Completed step {step_number} (Index: {current_index}). New index: {state['current_step_index']}")
+            if state.get("error_info"):
+                 state["error_info"] = None # Clear previous errors
+        else:
+            error_msg = step_error or f"Step failed with status: {step_status}"
+            logger.error(f"[Task {task_id} / execute_step] Step {step_number} failed: {error_msg}")
+            state["error_info"] = {"step": f"execute_step_{current_index}", "error": error_msg}
+            await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, error_msg)
+
+        # --- Update Progress --- 
         if task:
             progress = {
-                "completed_steps": current_index + 1,
+                "completed_steps": current_index + 1 if step_status in ["success", "completed_by_llm"] else current_index, # Only advance count on success
                 "total_steps": len(steps),
-                "current_step": current_step
+                "current_step": {"number": step_number, "name": step_name, "status": step_status}
             }
-            await crud_task.update_task(
-                db=db_session,
-                task_id=task_id,
-                obj=TaskUpdate(progress_data=progress)
-            )
-        
-        return state
-        
-    except Exception as e:
-        logger.exception(f"[Task {task_id}] Error executing step {current_index}: {str(e)}")
-        state["error_info"] = {"step": "execute_step", "error": str(e)}
-        await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, str(e))
+            await crud_task.update_task(db=db_session, task_id=task_id, obj=TaskUpdate(progress_data=progress))
+            logger.info(f"[Task {task_id} / execute_step] Progress updated.")
+
+        logger.info(f"[Task {task_id} / execute_step] <<< EXITING node for step index {current_index}")
         return state
 
-async def finalize_research_node(state: WorkflowState, researcher, db_session, task_id) -> WorkflowState:
+    except Exception as e:
+        logger.exception(f"[Task {task_id} / execute_step] XXX UNEXPECTED EXCEPTION in node for step {current_index}: {str(e)}")
+        state["error_info"] = {"step": f"execute_step_{current_index}", "error": str(e)}
+        await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, f"Unexpected error in step {current_index}: {str(e)}")
+        return state
+# --- End Refactored Node --- 
+
+async def finalize_research_node(state: WorkflowState, workflow_instance: 'ResearchWorkflow', db_session, task_id) -> WorkflowState:
     """Finalize the research workflow and synthesize results."""
-    logger.info(f"[Task {task_id}] Finalizing research")
+    logger.info(f"[Task {task_id} / finalize_research_node] >>> ENTERING Finalization Node") # Entry Log
+    final_status = TaskStatus.FAILED # Default to failed unless successful
+    error_info = None
+    final_result = None
     
     try:
-        # Check for errors
+        # Check for errors accumulated during execution
         if state.get("error_info"):
-            logger.error(f"[Task {task_id}] Finalizing with error: {state['error_info']}")
+            logger.error(f"[Task {task_id} / finalize_research_node] Finalizing with pre-existing error: {state['error_info']}")
             final_status = TaskStatus.FAILED
             error_info = state["error_info"]
-            final_result = None
         else:
-            # Synthesize results using researcher agent
-            logger.info(f"[Task {task_id}] Finalizing: Calling researcher.asynthesize_results...")
-            final_result = await researcher.asynthesize_results(
-                plan=state["current_plan"],
-                step_outputs=state["agent_outputs"]
-            )
-            # --- Added Detailed Logging --- 
-            logger.info(f"[Task {task_id}] Final synthesis result:\n{json.dumps(final_result, indent=2)}")
-            # --- End Added Logging ---
-            final_status = TaskStatus.COMPLETED
-            error_info = None
-            logger.info(f"[Task {task_id}] Research finalized successfully")
+            # --- Modify to use LLM directly for synthesis --- 
+            logger.info(f"[Task {task_id} / finalize_research_node] No pre-existing errors found. Synthesizing results using LLM...")
             
-        # Update task status and results
+            synthesis_prompt = f"""Synthesize the results from the following steps into a comprehensive final report.
+
+Research Plan:
+{json.dumps(state.get("current_plan",{}), indent=2, default=state_serializer)}
+
+Step Outputs:
+{json.dumps(state.get("agent_outputs", {}), indent=2, default=state_serializer)}
+
+Please provide:
+1. Executive Summary
+2. Key Findings from each relevant step
+3. Integrated Analysis
+4. Supporting Evidence (if applicable)
+5. Actionable Recommendations (if applicable)
+6. Risk Considerations (if applicable)
+
+Format the response as a well-structured report suitable for financial professionals."""
+
+            try:
+                 # --- Add Delay ---
+                 logger.info(f"[Task {task_id} / finalize_research_node] Waiting 15s before LLM call...")
+                 await asyncio.sleep(15)
+                 # --- End Delay ---
+                 llm_response = await workflow_instance.llm.ainvoke([HumanMessage(content=synthesis_prompt)])
+                 final_result = {
+                     "synthesis": llm_response.content,
+                     "timestamp": datetime.utcnow().isoformat()
+                 }
+                 logger.info(f"[Task {task_id} / finalize_research_node] Final synthesis successful.")
+                 final_status = TaskStatus.COMPLETED # Set status to completed on success
+                 error_info = None # Clear error info on success
+
+            except Exception as synth_err:
+                logger.error(f"[Task {task_id} / finalize_research_node] Error during LLM synthesis: {synth_err}", exc_info=True)
+                final_result = {"synthesis": f"Error synthesizing results: {str(synth_err)}"}
+                final_status = TaskStatus.FAILED
+                error_info = {"step": "finalize_synthesis", "error": str(synth_err)}
+            # --- End Modification --- 
+            
+        # --- Database Update --- 
+        logger.info(f"[Task {task_id} / finalize_research_node] Preparing final database update. Status: {final_status}")
         task_update = TaskUpdate(
             status=final_status,
-            error_details=error_info.get("error") if error_info else None,
+            error_details=error_info["error"] if error_info else None,
             output_data=final_result if final_result else None,
-            completed_at=datetime.utcnow()
+            completed_at=datetime.utcnow() if final_status == TaskStatus.COMPLETED else None # Only set completed_at if truly completed
         )
         
         await crud_task.update_task(
@@ -397,85 +551,149 @@ async def finalize_research_node(state: WorkflowState, researcher, db_session, t
             task_id=task_id,
             obj=task_update
         )
+        logger.info(f"[Task {task_id} / finalize_research_node] Database task updated successfully.") # Log after DB update
+        # --- End Database Update --- 
             
         # Update state
         state["final_result"] = final_result
         state["status"] = final_status
+        state["error_info"] = error_info # Ensure error info is in final state if failed
+        logger.info(f"[Task {task_id} / finalize_research_node] <<< EXITING Finalization Node. Final State Status: {state['status']}") # Exit Log
         return state
         
     except Exception as e:
-        logger.error(f"[Task {task_id}] Error finalizing research: {str(e)}")
-        state["error_info"] = {"step": "finalize", "error": str(e)}
-        await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, str(e))
+        # Catch errors *within* the finalization node itself (e.g., DB update failure)
+        logger.error(f"[Task {task_id} / finalize_research_node] XXX UNEXPECTED error during finalization: {str(e)}", exc_info=True)
+        # Update state with the finalization error
+        state["error_info"] = {"step": "finalize_node_internal", "error": str(e)}
+        state["status"] = TaskStatus.FAILED
+        # Attempt to update DB status one last time
+        try:
+            await crud_task.update_task_status(db_session, task_id, TaskStatus.FAILED, f"Finalization node error: {str(e)}")
+            logger.info(f"[Task {task_id} / finalize_research_node] Set final status to FAILED in DB due to finalization error.")
+        except Exception as db_err:
+            logger.error(f"[Task {task_id} / finalize_research_node] FAILED to update task status to FAILED after finalization error: {db_err}")
+        logger.info(f"[Task {task_id} / finalize_research_node] <<< EXITING Finalization Node with UNEXPECTED ERROR.") # Exit Log
         return state
 
 def check_continuation(state: WorkflowState) -> bool:
     """Check if the workflow should continue to the next step."""
-    current_step = state.get("current_step_index", 0)
+    current_index = state.get("current_step_index", 0)
     task_id = state.get("task_id", "unknown")
-    logger.info(f"[Task {task_id} / Edge check_continuation] Checking: current_step_index={current_step}")
-    logger.debug(f"[Task {task_id} / Edge check_continuation] Full state entering edge: {json.dumps(state, indent=2, default=str)}")
+    logger.info(f"[Task {task_id} / Edge check_continuation] Checking continuation from step index {current_index}")
+    logger.debug(f"[Task {task_id} / Edge check_continuation] Full state: {json.dumps(state, indent=2, default=str)}")
     
-    # --- Modified Error Check --- 
+    # Check for errors
     error_info = state.get("error_info")
     if error_info and error_info.get("error") is not None:
-        logger.error(f"[Task {task_id} / Edge check_continuation] Stopping due to error_info: {error_info}")
+        logger.error(f"[Task {task_id} / Edge check_continuation] Stopping due to error: {error_info}")
         return False
-    # --- End Modified Error Check --- 
     
-    # Check if we're stopping for approval (Should not happen post-resume, but good check)
-    # if state.get("stop_for_approval", False) and not state.get("plan_approved", False):
-    #     logger.info(f"[Task {task_id} / Edge check_continuation] Stopping for plan approval (unexpected here)")
-    #     return False
-    
-    # Get current plan
+    # Get and validate plan
     current_plan = state.get("current_plan")
     if not current_plan:
-        logger.error(f"[Task {task_id} / Edge check_continuation] No current_plan found in state.")
-        # Setting error here might prevent finalize node from running
-        # state["error_info"] = {"step": "check_continuation", "error": "No plan in state"}
-        return False # Stop execution if no plan
-    
-    # Handle string plans (Should be dict by now, but check defensively)
-    if isinstance(current_plan, str):
-        try:
-            current_plan = json.loads(current_plan)
-        except json.JSONDecodeError:
-            logger.error(f"[Task {task_id} / Edge check_continuation] Invalid JSON string in plan.")
-            return False
-    
-    if not isinstance(current_plan, dict):
-        logger.error(f"[Task {task_id} / Edge check_continuation] current_plan is not a dictionary.")
+        logger.error(f"[Task {task_id} / Edge check_continuation] No plan found in state")
         return False
     
-    # Extract steps (using same logic as execute_step_node for consistency)
     try:
-        steps = _extract_steps(current_plan) # Use the helper function
-        logger.info(f"[Task {task_id} / Edge check_continuation] Extracted {len(steps)} steps from plan.")
-    except Exception as e:
-        logger.error(f"[Task {task_id} / Edge check_continuation] Failed to extract steps from plan: {e}")
-        return False # Stop if steps can't be extracted
-    
-    if not steps:
-        logger.error(f"[Task {task_id} / Edge check_continuation] No steps extracted from plan.")
-        return False
+        # Extract steps using consistent logic
+        workflow_plan = (
+            current_plan.get("plan", {}).get("WorkflowPlan", {})
+            or current_plan.get("plan", {})
+            or current_plan
+        )
         
-    # Check if we have more steps to execute
-    has_more_steps = current_step < len(steps)
-    logger.info(f"[Task {task_id} / Edge check_continuation] Result: Has more steps? {has_more_steps} (current={current_step}, total={len(steps)})")
-    
-    # Return True only if we have more steps and no *actual* error
-    return has_more_steps
+        steps = (
+            workflow_plan.get("Steps")
+            or workflow_plan.get("steps")
+            or []
+        )
+        
+        if not steps:
+            logger.error(f"[Task {task_id} / Edge check_continuation] No steps found in plan")
+            return False
+        
+        # Map indices to steps
+        step_map = {i: step for i, step in enumerate(steps)}
+        total_steps = len(steps)
+        
+        # Check if we have more steps
+        has_more_steps = current_index < total_steps
+        
+        if not has_more_steps:
+            logger.info(f"[Task {task_id} / Edge check_continuation] No more steps to execute (current_index={current_index}, total_steps={total_steps})")
+            return False
+            
+        # Log current step execution details
+        current_outputs = state.get("agent_outputs", {})
+        current_step_key = f"step_{current_index-1}"
+        current_step_result = current_outputs.get(current_step_key) if current_index > 0 else None
+        
+        logger.info(f"[Task {task_id} / Edge check_continuation] Current step ({current_index-1}) result: {current_step_result}")
+        
+        if current_index > 0:
+            if not current_step_result:
+                logger.error(f"[Task {task_id} / Edge check_continuation] No result found for step {current_index-1}")
+                return False
+                
+            step_status = current_step_result.get("status")
+            step_error = current_step_result.get("error")
+            logger.info(f"[Task {task_id} / Edge check_continuation] Step {current_index-1} status: {step_status}, error: {step_error}")
+            
+            if step_status not in ["success", "completed", "completed_by_llm"]:
+                logger.error(f"[Task {task_id} / Edge check_continuation] Previous step {current_index-1} not properly completed (status: {step_status})")
+                return False
+        
+        # Check if next step's dependencies are satisfied
+        next_step = step_map.get(current_index)
+        if next_step:
+            dependencies = next_step.get("dependencies", [])
+            logger.info(f"[Task {task_id} / Edge check_continuation] Checking dependencies for step {current_index}: {dependencies}")
+            
+            for dep in dependencies:
+                dep_index = dep - 1  # Convert 1-based step number to 0-based index
+                dep_result = current_outputs.get(f"step_{dep_index}")
+                dep_status = dep_result.get("status") if dep_result else None
+                
+                logger.info(f"[Task {task_id} / Edge check_continuation] Dependency {dep} (index {dep_index}) status: {dep_status}")
+                # --- Add detailed log before check ---
+                check_result = dep_status not in ["success", "completed", "completed_by_llm"]
+                logger.debug(f"[Task {task_id} / Edge check_continuation] Evaluating dependency: dep_result exists = {dep_result is not None}, dep_status = '{dep_status}', check_failed = {check_result}")
+                loggable_dep_result = json.dumps(dep_result, indent=2, default=state_serializer)
+                logger.debug(f"[Task {task_id} / Edge check_continuation] Full dependency result (step_{dep_index}): {loggable_dep_result}")
+                # --- End detailed log ---
+                
+                if not dep_result or dep_status not in ["success", "completed", "completed_by_llm"]:
+                    logger.error(f"[Task {task_id} / Edge check_continuation] Dependency step {dep} (index {dep_index}) not satisfied")
+                    return False
+        
+        logger.info(f"[Task {task_id} / Edge check_continuation] All checks passed. Continuing to step index {current_index} ({current_index + 1}/{total_steps})")
+        logger.info(f"[Task {task_id} / Edge check_continuation] <<< Returning TRUE") # Log result
+        return True
+        
+    except Exception as e:
+        logger.exception(f"[Task {task_id} / Edge check_continuation] Error checking continuation: {str(e)}")
+        logger.info(f"[Task {task_id} / Edge check_continuation] <<< Returning FALSE (Exception)") # Log result
+        return False
 
 def check_approval(state: WorkflowState) -> bool:
     """Check if the plan has been approved."""
     task_id = state.get("task_id", "unknown")
+    logger.info(f"[Task {task_id} / Edge check_approval] >>> ENTERING check_approval edge") # New log
     logger.info(f"[Task {task_id} / Edge check_approval] Checking plan approval status.")
     logger.debug(f"[Task {task_id} / Edge check_approval] Full state entering edge: {json.dumps(state, indent=2, default=str)}")
+    
+    # --- Add detailed logging ---
+    plan_approved_in_state = state.get("plan_approved", False)
+    stop_for_approval_in_state = state.get("stop_for_approval", False)
+    error_info_in_state = state.get("error_info")
+    logger.info(f"[Task {task_id} / Edge check_approval] State details - plan_approved: {plan_approved_in_state}, stop_for_approval: {stop_for_approval_in_state}, error_info: {error_info_in_state}")
+    # --- End logging ---
     
     # If we have an error, don't continue
     if state.get("error_info"):
         logger.error(f"[Task {task_id} / Edge check_approval] Cannot proceed due to error_info: {state['error_info']}")
+        logger.info(f"[Task {task_id} / Edge check_approval] <<< EXITING check_approval edge with result: False (due to error)") # New log
         return False
         
     # Check if we're waiting for approval (stop_for_approval should be True initially)
@@ -483,15 +701,20 @@ def check_approval(state: WorkflowState) -> bool:
     plan_approved = state.get("plan_approved", False)
     stop_for_approval = state.get("stop_for_approval", False)
     
+    logger.info(f"[Task {task_id} / Edge check_approval] Checking: stop_for_approval={stop_for_approval}, plan_approved={plan_approved}") # New log
+    
     if stop_for_approval and not plan_approved:
          logger.info(f"[Task {task_id} / Edge check_approval] Result: False (stop_for_approval=True, plan_approved=False)")
+         logger.info(f"[Task {task_id} / Edge check_approval] <<< EXITING check_approval edge with result: False (waiting)") # New log
          return False # Waiting for approval
 
     if not plan_approved:
         logger.info(f"[Task {task_id} / Edge check_approval] Result: False (plan_approved=False)")
+        logger.info(f"[Task {task_id} / Edge check_approval] <<< EXITING check_approval edge with result: False (not approved)") # New log
         return False # Plan not approved yet
         
     logger.info(f"[Task {task_id} / Edge check_approval] Result: True (plan_approved=True)")
+    logger.info(f"[Task {task_id} / Edge check_approval] <<< EXITING check_approval edge with result: True (approved)") # New log
     return True
 
 class ResearchWorkflow:
@@ -500,15 +723,18 @@ class ResearchWorkflow:
         self.task_id = task_id
         self.db_session = db_session
         
-        # Initialize agents
+        # Initialize planner agent
         self.planner = create_planner_agent()
-        self.researcher = create_research_agent()
-        self.coordinator = create_coordinator_agent()
         
-        # Initialize memory saver for checkpointing
-        self.memory_saver = MemorySaver()
-        
-        # Build workflow graph
+        # --- Initialize LLM directly --- 
+        if not settings.GEMINI_API_KEY:
+             raise ValueError("GEMINI_API_KEY must be set in settings")
+        # --- Set specific model name --- 
+        self.llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=settings.GEMINI_API_KEY)
+        logger.info(f"Initialized Gemini LLM: {self.llm.model}")
+        # --- End LLM Initialization / Model Change --- 
+
+        # Build workflow graph (stateless compile)
         self.graph = self._build_graph()
         logger.info(f"[Task {task_id}] Built workflow graph")
 
@@ -516,42 +742,32 @@ class ResearchWorkflow:
         """Build the workflow graph."""
         logger.info(f"[Task {self.task_id}] Building workflow graph")
         
-        # Create the graph
         workflow = StateGraph(WorkflowState)
         
         # Add nodes
         workflow.add_node("generate_plan", self._generate_plan_wrapper)
+        # --- Rename execute_step node --- 
         workflow.add_node("execute_step", self._execute_step_wrapper)
+        # --- End rename ---
         workflow.add_node("finalize", self._finalize_research_wrapper)
         
-        # Add conditional edges for plan generation and approval
+        # Add conditional edges 
         workflow.add_conditional_edges(
             "generate_plan",
-            check_approval,  # Use check_approval function to determine next step
-            {
-                True: "execute_step",  # If approved, move to execution
-                False: END  # If not approved or error, end workflow
-            }
+            check_approval,
+            { True: "execute_step", False: END }
         )
-        
-        # Add conditional edges for step execution
         workflow.add_conditional_edges(
             "execute_step",
-            check_continuation,  # Use check_continuation function to determine next step
-            {
-                True: "execute_step",  # Continue executing steps if there are more
-                False: "finalize"  # Move to finalization if done or error
-            }
+            check_continuation,
+            { True: "execute_step", False: "finalize" }
         )
-        
-        # Add edge from finalize to end
         workflow.add_edge("finalize", END)
-        
-        # Set entry point
         workflow.set_entry_point("generate_plan")
         
-        # Compile graph with checkpointing
-        return workflow.compile(checkpointer=self.memory_saver)
+        # Compile graph WITHOUT checkpointer
+        logger.info(f"[Task {self.task_id}] Compiling graph without checkpointer.")
+        return workflow.compile()
 
     async def _generate_plan_wrapper(self, state: WorkflowState) -> WorkflowState:
         """Wrapper for generate_plan_node."""
@@ -577,9 +793,10 @@ class ResearchWorkflow:
             return state
 
     async def _execute_step_wrapper(self, state: WorkflowState) -> WorkflowState:
-        """Wrapper for execute_step_node."""
-        logger.info(f"[Task {self.task_id}] Entered _execute_step_wrapper") 
-        logger.debug(f"[Task {self.task_id}] State entering _execute_step_wrapper: {json.dumps(state, indent=2, default=str)}")
+        """Wrapper for execute_step node."""
+        logger.info(f"[Task {self.task_id}] >>> ENTERING _execute_step_wrapper node logic") 
+        logger.debug(f"[Task {self.task_id}] State entering _execute_step_wrapper: {json.dumps(state, indent=2, default=state_serializer)}")
+        logger.info(f"[Task {self.task_id}] _execute_step_wrapper: STARTING execution. plan_approved: {state.get('plan_approved')}, current_plan exists: {state.get('current_plan') is not None}")
         try:
             # Ensure we have a plan and it's approved
             logger.info(f"[Task {self.task_id}] Checking plan existence and approval status in _execute_step_wrapper...") 
@@ -590,10 +807,12 @@ class ResearchWorkflow:
                 logger.error(f"[Task {self.task_id}] _execute_step_wrapper: Plan not approved") 
                 raise ValueError("Plan not approved")
             
-            logger.info(f"[Task {self.task_id}] Plan found and approved. Calling execute_step_node...") 
-            state = await execute_step_node(state, self.coordinator, self.researcher, self.db_session, self.task_id)
+            logger.info(f"[Task {self.task_id}] Plan found and approved. Calling execute_step...") 
+            # --- Modify call to pass self for tool/llm access --- 
+            state = await execute_step(state, self, self.db_session, self.task_id)
+            # --- End modification ---
             logger.info(f"[Task {self.task_id}] Exiting _execute_step_wrapper. Current index: {state.get('current_step_index')}. Error: {state.get('error_info')}")
-            logger.debug(f"[Task {self.task_id}] State exiting _execute_step_wrapper: {json.dumps(state, indent=2, default=str)}")
+            logger.debug(f"[Task {self.task_id}] State exiting _execute_step_wrapper: {json.dumps(state, indent=2, default=state_serializer)}")
             return state
             
         except Exception as e:
@@ -607,89 +826,73 @@ class ResearchWorkflow:
         """Wrapper for finalize_research_node."""
         logger.info(f"[Task {self.task_id}] Entered _finalize_research_wrapper") # Added log
         logger.debug(f"[Task {self.task_id}] State entering _finalize_research_wrapper: {json.dumps(state, indent=2, default=str)}")
-        state = await finalize_research_node(state, self.researcher, self.db_session, self.task_id)
+        state = await finalize_research_node(state, self, self.db_session, self.task_id)
         logger.info(f"[Task {self.task_id}] Exiting _finalize_research_wrapper. Final status: {state.get('status')}")
         logger.debug(f"[Task {self.task_id}] State exiting _finalize_research_wrapper: {json.dumps(state, indent=2, default=str)}")
         return state
 
     async def execute(self, initial_state: Dict[str, Any]) -> Dict[str, Any]:
         """Execute the workflow with initial state."""
-        logger.info(f"[Task {self.task_id}] Entered ResearchWorkflow.execute()") # Added log
-        logger.info(f"[Task {self.task_id}] ResearchWorkflow.execute(): Initializing state...") # Added log
+        logger.info(f"[Task {self.task_id}] Entered ResearchWorkflow.execute()") 
+        # Simplified initial state using WorkflowState defaults
         state = WorkflowState(
             task_id=initial_state["task_id"],
             task_type=initial_state["task_type"],
             initial_request=initial_state["initial_request"],
-            input_data=initial_state["input_data"],
-            current_step_index=0,
-            current_plan=initial_state.get("current_plan"),
-            plan_approved=False,
-            agent_inputs={},
-            agent_outputs={},
-            intermediate_results={},
-            final_result=None,
-            error_info=None,
-            metadata={},
-            status=TaskStatus.PLANNING
+            input_data=initial_state["input_data"]
         )
-        logger.info(f"[Task {self.task_id}] ResearchWorkflow.execute(): State initialized. Calling self.graph.ainvoke...") # Added log
-        logger.debug(f"[Task {self.task_id}] Initial State for execute graph: {json.dumps(state, indent=2, default=str)}")
-        # Execute graph
-        config = {"configurable": {"thread_id": str(self.task_id)}}
-        final_state = await self.graph.ainvoke(state, config=config)
-        logger.info(f"[Task {self.task_id}] ResearchWorkflow.execute(): self.graph.ainvoke completed") # Added log
+        logger.info(f"[Task {self.task_id}] ResearchWorkflow.execute(): State initialized. Calling self.graph.ainvoke...")
+        # Execute graph - no config needed as graph is stateless now
+        final_state = await self.graph.ainvoke(state)
+        logger.info(f"[Task {self.task_id}] ResearchWorkflow.execute(): self.graph.ainvoke completed")
         return final_state
 
     async def resume(self) -> Dict[str, Any]:
         """Resume workflow execution after plan approval."""
-        logger.info(f"[Task {self.task_id}] Entered ResearchWorkflow.resume()") 
+        logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] >>> ENTERING resume method") # Entry Log
         try:
-            # Get current state from database
-            logger.info(f"[Task {self.task_id}] ResearchWorkflow.resume(): Getting task from DB...") 
+            logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] Getting task from DB...") 
             task = await crud_task.get_task(self.db_session, self.task_id)
             if not task:
-                logger.error(f"[Task {self.task_id}] ResearchWorkflow.resume(): Task not found in DB") 
+                logger.error(f"[Task {self.task_id} / ResearchWorkflow.resume] Task not found in DB") 
                 raise ValueError("Task not found")
-            logger.info(f"[Task {self.task_id}] ResearchWorkflow.resume(): Task found. Status: {task.status}") 
-                
-            # Initialize state with current task data
-            logger.info(f"[Task {self.task_id}] ResearchWorkflow.resume(): Initializing state for resume...") 
-            state = WorkflowState(
-                task_id=str(self.task_id),
-                task_type=task.task_type.value,
-                initial_request=task.description,
-                input_data=task.input_data or {},
-                # --- Start execution from step 0 after resume --- 
-                current_step_index=0, 
-                # --- Load the plan from the task --- 
-                current_plan=task.plan,
-                plan_approved=True, # Set approved flag
-                agent_inputs={},
-                agent_outputs={},
-                intermediate_results={},
-                final_result=None,
-                error_info=None,
-                metadata={},
-                # --- Status should reflect it's now running --- 
-                status=TaskStatus.IN_PROGRESS,
-                stop_for_approval=False  # Don't stop for approval when resuming
-            )
-            logger.info(f"[Task {self.task_id}] ResearchWorkflow.resume(): State initialized. Plan loaded: {task.plan is not None}. Approved: {state.get('plan_approved')}") 
+            logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] Task found. Status: {task.status}") 
             
-            # Execute graph
-            config = {"configurable": {"thread_id": str(self.task_id)}}
-            logger.info(f"[Task {self.task_id}] ResearchWorkflow.resume(): Calling self.graph.ainvoke...") 
-            logger.debug(f"[Task {self.task_id}] State for resume graph: {json.dumps(state, indent=2, default=str)}")
-            final_state = await self.graph.ainvoke(state, config=config)
-            logger.info(f"[Task {self.task_id}] ResearchWorkflow.resume(): self.graph.ainvoke completed") 
-            logger.debug(f"[Task {self.task_id}] Final state from resume graph: {json.dumps(final_state, indent=2, default=str)}")
+            # --- Load State from DB Checkpoint --- 
+            logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] Loading state from checkpoint_data...")
+            if not task.checkpoint_data:
+                logger.error(f"[Task {self.task_id} / ResearchWorkflow.resume] Checkpoint data missing in task!")
+                raise ValueError("Checkpoint data missing")
+            
+            try:
+                loaded_state_dict = json.loads(task.checkpoint_data)
+                logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] Checkpoint JSON loaded.")
+                # Rehydrate state using WorkflowState class to ensure methods/defaults
+                state = WorkflowState(**loaded_state_dict) # Use **kwargs for Pydantic init
+                # Update status and flags for resume
+                state["plan_approved"] = True
+                state["stop_for_approval"] = False
+                state["status"] = TaskStatus.IN_PROGRESS # Ensure status reflects running
+                logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] State rehydrated. Plan approved flag set.")
+            except Exception as load_err:
+                logger.error(f"[Task {self.task_id} / ResearchWorkflow.resume] FAILED TO LOAD/REHYDRATE STATE: {str(load_err)}", exc_info=True)
+                raise ValueError(f"Failed to load checkpoint state: {str(load_err)}")
+            # --- End Load State --- 
+
+            # Execute graph - no config needed
+            logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] Calling self.graph.ainvoke...") 
+            logger.debug(f"[Task {self.task_id} / ResearchWorkflow.resume] State for resume graph: {json.dumps(state, default=state_serializer)}")
+            final_state = await self.graph.ainvoke(state) # No config needed
+            logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] self.graph.ainvoke completed") 
+            logger.debug(f"[Task {self.task_id} / ResearchWorkflow.resume] Final state from resume graph: {json.dumps(final_state, default=state_serializer)}")
+            logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] <<< EXITING resume method successfully.") # Exit Log
             return final_state
             
         except Exception as e:
-            logger.error(f"[Task {self.task_id}] Error resuming workflow: {str(e)}", exc_info=True)
-            error_state = {"error_info": {"step": "resume", "error": str(e)}}
-            await crud_task.update_task_status(self.db_session, self.task_id, TaskStatus.FAILED, str(e))
-            return error_state
+            logger.error(f"[Task {self.task_id} / ResearchWorkflow.resume] XXX UNEXPECTED error during resume: {str(e)}", exc_info=True)
+            logger.info(f"[Task {self.task_id} / ResearchWorkflow.resume] <<< EXITING resume method with ERROR.") # Exit Log
+            # Optionally re-raise or return error state
+            raise # Re-raise the exception for now
 
     async def get_state(self) -> Optional[Dict[str, Any]]:
         """Get current workflow state."""

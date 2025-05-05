@@ -5,7 +5,6 @@ from langgraph.checkpoint.memory import MemorySaver
 from app.agents import (
     create_planner_agent,
     create_backtest_agent,
-    create_coordinator_agent
 )
 from app.crud import crud_task
 from app.models.task import TaskStatus
@@ -147,7 +146,6 @@ class BacktestWorkflow:
         self.db_session = db_session
         self.planner = create_planner_agent()
         self.backtester = create_backtest_agent()
-        self.coordinator = create_coordinator_agent()
         self.memory = MemorySaver()
         self.graph = self._build_graph()
 
@@ -167,7 +165,7 @@ class BacktestWorkflow:
         # Add nodes
         workflow.add_node("generate_backtest_plan", _wrapped_generate_plan)
         workflow.add_node("execute_fetch_backtest_data", _wrapped_fetch_data)
-        workflow.add_node("execute_run_backtest", _wrapped_run_backtest)
+        workflow.add_node("execute_run_backtest", _wrapped_run_test)
         workflow.add_node("finalize_backtest", _wrapped_finalize)
 
         # Set entry point

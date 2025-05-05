@@ -1,4 +1,4 @@
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Dict
 from uuid import UUID
 from fastapi import HTTPException
 from app.crud import crud_task
@@ -42,14 +42,13 @@ class TaskService:
         try:
             logger.info(f"Creating workflow for task type: {task_create.task_type}")
             if task_create.task_type == TaskType.RESEARCH:
+                # Don't pass checkpointer anymore
                 workflow = ResearchWorkflow(task.id, self.db)
                 logger.info("Created ResearchWorkflow")
             elif task_create.task_type == TaskType.STRATEGY_DEV:
-                workflow = StrategyWorkflow(task.id, self.db)
-                logger.info("Created StrategyWorkflow")
+                raise ValueError(f"STRATEGY_DEV workflow needs checkpointer modification review")
             elif task_create.task_type == TaskType.BACKTEST:
-                workflow = BacktestWorkflow(task.id, self.db)
-                logger.info("Created BacktestWorkflow")
+                raise ValueError(f"BACKTEST workflow needs checkpointer modification review")
             else:
                 logger.error(f"Unsupported task type: {task_create.task_type}")
                 raise ValueError(f"Unsupported task type: {task_create.task_type}")
@@ -113,21 +112,20 @@ class TaskService:
         await crud_task.update_task_status(self.db, task_id, TaskStatus.IN_PROGRESS)
         logger.info(f"[Task {task_id}] Status updated to IN_PROGRESS in DB.")
         
-        # --- Run workflow execution SYNCHRONOUSLY --- 
+        # --- Run Workflow (No Checkpointer Retrieval Needed) --- 
         try:
             logger.info(f"[Task {task_id}] Attempting to run workflow SYNCHRONOUSLY...") 
             
-            # Re-instantiate the workflow directly
+            # Re-instantiate the workflow directly (doesn't need checkpointer passed)
             logger.info(f"[Task {task_id}] Re-instantiating workflow for synchronous run...")
             if task.task_type == TaskType.RESEARCH:
                 workflow = ResearchWorkflow(task_id, self.db)
                 logger.info(f"[Task {task_id}] Created ResearchWorkflow for synchronous run")
-            elif task.task_type == TaskType.STRATEGY_DEV:
-                workflow = StrategyWorkflow(task_id, self.db)
-                logger.info(f"[Task {task_id}] Created StrategyWorkflow for synchronous run")
-            elif task.task_type == TaskType.BACKTEST:
-                workflow = BacktestWorkflow(task_id, self.db)
-                logger.info(f"[Task {task_id}] Created BacktestWorkflow for synchronous run")
+            # Add other workflow types here if needed
+            # elif task.task_type == TaskType.STRATEGY_DEV:
+            #     workflow = StrategyWorkflow(task_id, self.db)
+            # elif task.task_type == TaskType.BACKTEST:
+            #     workflow = BacktestWorkflow(task_id, self.db)
             else:
                 logger.error(f"[Task {task_id}] Unsupported task type for synchronous run: {task.task_type}")
                 raise ValueError(f"Unsupported task type for synchronous run: {task.task_type}")

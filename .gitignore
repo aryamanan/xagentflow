@@ -56,3 +56,5 @@ local_kb/
 .coverage
 htmlcov/
 .pytest_cache/ 
+
+/external
